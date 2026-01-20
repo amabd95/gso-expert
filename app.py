@@ -11,7 +11,7 @@ from datetime import datetime
 if not firebase_admin._apps:
     cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred, {
-        'storageBucket': 'gso-database.firebasestorage.app' 
+        'storageBucket': 'gso-database.firebasestorage.app' # Replace with your bucket link
     })
 
 db = firestore.client()
@@ -29,7 +29,7 @@ def format_date_to_string(date_str):
 def is_expired(expiry_ddmmyy):
     try:
         exp_date = datetime.strptime(expiry_ddmmyy, "%d%m%y")
-        return exp_date < datetime.now()
+        return exp_date < datetime.today()
     except: return True
 
 def add_signature_to_pdf(page):
@@ -45,7 +45,7 @@ def create_template(temp_type):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. PREMIUM UI DESIGN ---
+# --- 3. UI DESIGN (MATT PURPLE) ---
 st.set_page_config(page_title="GSO Expert Pro", layout="wide")
 
 st.markdown("""
@@ -53,9 +53,10 @@ st.markdown("""
     .stApp { background-color: #F3F0F7; }
     [data-testid="stSidebar"] { background-color: #4B3F72 !important; }
     [data-testid="stSidebar"] * { color: #FFFFFF !important; }
+    h1, h2, h3 { color: #2E2841; font-family: 'Segoe UI', sans-serif; }
     div[data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #D1C4E9; padding: 15px; border-radius: 12px; }
-    .stButton>button { background: #7A61BA; color: white; border-radius: 8px; font-weight: bold; border: none; }
-    .footer { position: fixed; left: 0; bottom: 0; width: 100%; background-color: #4B3F72; color: #FFFFFF; text-align: center; padding: 8px; font-weight: bold; z-index: 100; }
+    .stButton>button { background: #7A61BA; color: white; border-radius: 8px; font-weight: bold; border: none; height: 3em; }
+    .footer { position: fixed; left: 0; bottom: 0; width: 100%; background-color: #4B3F72; color: #FFFFFF; text-align: center; padding: 8px; z-index: 100; font-weight: bold; }
     </style>
     <div class="footer">MADE BY ABDULLAH ALHAKIM</div>
     """, unsafe_allow_html=True)
@@ -67,9 +68,9 @@ with st.sidebar:
 # --- PAGE: DASHBOARD ---
 if menu == "Dashboard":
     st.title("📊 Control Center")
-    today = datetime.now().strftime("%d %B %Y")
+    today_display = datetime.now().strftime("%d %B %Y")
     c1, c2 = st.columns(2)
-    with c1: st.metric("System Date", today)
+    with c1: st.metric("System Date", today_display)
     with c2: st.metric("Database", "Online")
     st.markdown("### 📥 Templates")
     st.download_button("Download Michelin Template", create_template("MICHELIN"), "Michelin_Template.xlsx")
@@ -97,6 +98,7 @@ elif menu == "Add Certificates":
                         country = re.search(r"Country of Production:\s*(.*)", text).group(1).strip().upper()
 
                         clean_size = size.replace('/', '-')
+                        # We use a unique ID for the document to make searching 100% accurate
                         doc_id = f"{brand}_{ref}_{country}_{exp}" if brand in ["MICHELIN", "BFGOODRICH"] else f"{brand}_{clean_size}_{pattern}_{exp}"
 
                         new_doc = fitz.open()
@@ -107,7 +109,7 @@ elif menu == "Add Certificates":
                         
                         db.collection("gso_database").document(doc_id).set({
                             "brand": brand, "expiry": exp, "url": blob.public_url,
-                            "ref_no": ref, "country": country, "size": size, "pattern": pattern
+                            "ref_no": ref, "country": country, "size": clean_size, "pattern": pattern
                         })
                         st.success(f"Uploaded: {doc_id}")
                     except: continue
@@ -124,38 +126,42 @@ elif menu == "Search & Merge":
         combined_pdf = fitz.open()
         missing = []
         
-        # We fetch ALL docs once to avoid the Firestore index error
-        all_docs = {doc.id: doc.to_dict() for doc in db.collection("gso_database").get()}
+        # Optimized Search: We fetch only relevant documents
+        progress_bar = st.progress(0)
+        total = len(df)
 
         for index, row in df.iterrows():
-            found_data = None
-            
-            # Match manually in the list we just downloaded
-            for doc_id, data in all_docs.items():
-                if mode == "MICHELIN / BFG":
-                    if data.get('ref_no') == row.iloc[0].strip().zfill(6) and data.get('country') == row.iloc[1].strip().upper():
-                        found_data = (doc_id, data)
-                        break
-                else:
-                    if data.get('brand') == row.iloc[0].strip().upper() and row.iloc[1].strip().replace('/', '-') in data.get('size', '').replace('/', '-') and data.get('pattern') == row.iloc[2].strip().upper():
-                        found_data = (doc_id, data)
-                        break
+            found_doc = None
+            if mode == "MICHELIN / BFG":
+                ref = row.iloc[0].strip().zfill(6)
+                country = row.iloc[1].strip().upper()
+                # Use a specific query on documented fields
+                results = db.collection("gso_database").where("ref_no", "==", ref).where("country", "==", country).limit(1).get()
+            else:
+                brand = row.iloc[0].strip().upper()
+                size = row.iloc[1].strip().replace('/', '-')
+                pattern = row.iloc[2].strip().upper()
+                results = db.collection("gso_database").where("brand", "==", brand).where("size", "==", size).where("pattern", "==", pattern).limit(1).get()
 
-            if found_data:
-                doc_id, data = found_data
+            if results:
+                data = results[0].to_dict()
                 if is_expired(data['expiry']):
                     missing.append(f"Row {index+2}: Expired")
-                    continue
-                pdf_bytes = bucket.blob(f"certificates/{doc_id}.pdf").download_as_bytes()
-                match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                for page in match_doc: add_signature_to_pdf(page)
-                combined_pdf.insert_pdf(match_doc)
-            else: missing.append(f"Row {index+2}: Not Found")
+                else:
+                    pdf_bytes = bucket.blob(f"certificates/{results[0].id}.pdf").download_as_bytes()
+                    match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    for page in match_doc: add_signature_to_pdf(page)
+                    combined_pdf.insert_pdf(match_doc)
+            else:
+                missing.append(f"Row {index+2}: Not Found")
+            
+            progress_bar.progress((index + 1) / total)
 
         if len(combined_pdf) > 0:
             out = io.BytesIO()
             combined_pdf.save(out)
+            st.success(f"Generated {len(combined_pdf)} Page PDF")
             st.download_button("📥 DOWNLOAD REPORT", out.getvalue(), "GSO_Final_Report.pdf", "application/pdf")
         if missing:
-            with st.expander("Errors"):
+            with st.expander("Errors/Missing"):
                 for m in missing: st.error(m)
