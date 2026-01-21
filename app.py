@@ -13,7 +13,7 @@ if not firebase_admin._apps:
         creds_dict = dict(st.secrets["firebase_credentials"])
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
-            'storageBucket': 'gso-database.firebasestorage.app' # <--- PASTE YOUR BUCKET LINK HERE
+            'storageBucket': 'gso-database.firebasestorage.app' # <--- VERIFY YOUR BUCKET LINK HERE
         })
     except Exception as e:
         st.error(f"Database Connection Failed: {e}")
@@ -53,14 +53,7 @@ def create_template(temp_type):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. CACHING ENGINE (THE FIX) ---
-@st.cache_data(ttl=600) # Caches the database for 10 minutes to prevent timeouts
-def fetch_all_certificates():
-    # Downloads ONLY the text data (Brand, Size, etc.), not the PDFs. Fast & Cheap.
-    docs = db.collection("gso_database").stream()
-    return [{**doc.to_dict(), "id": doc.id} for doc in docs]
-
-# --- 4. UI DESIGN ---
+# --- 3. UI DESIGN ---
 st.set_page_config(page_title="GSO Expert Pro", layout="wide")
 st.markdown("""
     <style>
@@ -83,12 +76,6 @@ with st.sidebar:
 if menu == "Dashboard":
     st.title("📊 Control Center")
     today_display = datetime.now().strftime("%d %B %Y")
-    
-    # Force a reload of the cache to ensure fresh data
-    if st.button("🔄 Refresh Database"):
-        fetch_all_certificates.clear()
-        st.success("Database cache cleared!")
-
     c1, c2 = st.columns(2)
     with c1: st.metric("System Date", today_display)
     with c2: st.metric("Database", "Online")
@@ -145,9 +132,6 @@ elif menu == "Add Certificates":
             
             progress_bar.progress((i + 1) / len(uploaded_pdfs))
             status_text.text(f"Processed file {i+1} of {len(uploaded_pdfs)}")
-        
-        # Clear cache so new files appear in search immediately
-        fetch_all_certificates.clear()
         st.success("Sync Complete!")
 
 # --- PAGE: SEARCH ---
@@ -157,39 +141,50 @@ elif menu == "Search & Merge":
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
     if excel_file and st.button("Generate Report"):
-        # 1. LOAD DATA: Fetch all database entries ONCE (Cached)
-        with st.spinner("Loading Database..."):
-            all_certs = fetch_all_certificates()
-        
-        # 2. PROCESS EXCEL
         df = pd.read_excel(excel_file).astype(str).apply(lambda x: x.str.replace(r'\.0$', '', regex=True))
         combined_pdf = fitz.open()
         missing = []
         progress_bar = st.progress(0)
         
-        # 3. INSTANT FILTERING (Python Side)
         for index, row in df.iterrows():
             match_found = None
             
+            # STRATEGY: Query ONE field (Fast & Indexed by default), then Filter in Python
             if mode == "MICHELIN / BFG":
                 target_ref = row.iloc[0].strip().zfill(6)
                 target_country = row.iloc[1].strip().upper()
-                # Search the loaded list
-                match_found = next((item for item in all_certs if item.get('ref_no') == target_ref and item.get('country') == target_country), None)
+                
+                # 1. Broad Query (Ref Only) - Never fails
+                docs = db.collection("gso_database").where("ref_no", "==", target_ref).stream()
+                
+                # 2. Strict Filter (Country) - Done locally
+                for doc in docs:
+                    data = doc.to_dict()
+                    if data.get('country') == target_country:
+                        match_found = {**data, "id": doc.id}
+                        break
+                        
             else:
                 target_brand = row.iloc[0].strip().upper()
-                # Normalize Excel input (replace / with -)
                 target_size = row.iloc[1].strip().replace('/', '-')
                 target_pattern = row.iloc[2].strip().upper()
                 
-                # Smart Match: Check if sizes match (ignoring small typos)
-                match_found = next((item for item in all_certs if item.get('brand') == target_brand and item.get('pattern') == target_pattern and target_size in item.get('size', '').replace('/', '-')), None)
+                # 1. Broad Query (Size Only) - Never fails, handles "/" to "-" conversion
+                docs = db.collection("gso_database").where("size", "==", target_size).stream()
+                
+                # 2. Strict Filter (Brand & Pattern) - Done locally
+                for doc in docs:
+                    data = doc.to_dict()
+                    # Check Brand AND Pattern match
+                    if data.get('brand') == target_brand and data.get('pattern') == target_pattern:
+                        match_found = {**data, "id": doc.id}
+                        break
 
+            # 3. Process Result
             if match_found:
                 if is_expired(match_found['expiry']):
                     missing.append(f"Row {index+2}: Expired")
                 else:
-                    # Only contact Google to download the specific PDF
                     try:
                         pdf_bytes = bucket.blob(f"certificates/{match_found['id']}.pdf").download_as_bytes()
                         match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -209,4 +204,3 @@ elif menu == "Search & Merge":
         if missing:
             with st.expander("Errors/Missing"):
                 for m in missing: st.error(m)
-
