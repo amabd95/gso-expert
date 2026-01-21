@@ -1,15 +1,8 @@
-import streamlit as st
-import firebase_admin
-from firebase_admin import credentials, firestore, storage
-import fitz  # PyMuPDF
-import pandas as pd
-import io
-import re
-from datetime import datetime
-
-# --- 1. FIREBASE SETUP ---
+# --- 1. FIREBASE SETUP (UPDATED FOR SECRETS) ---
 if not firebase_admin._apps:
-    cred = credentials.Certificate("serviceAccountKey.json")
+    # This part pulls the data from the 'Secrets' you saved in Streamlit
+    creds_dict = dict(st.secrets["firebase_credentials"])
+    cred = credentials.Certificate(creds_dict)
     firebase_admin.initialize_app(cred, {
         'storageBucket': 'gso-database.firebasestorage.app' # Replace with your bucket link
     })
@@ -165,3 +158,4 @@ elif menu == "Search & Merge":
         if missing:
             with st.expander("Errors/Missing"):
                 for m in missing: st.error(m)
+
