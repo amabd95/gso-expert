@@ -10,6 +10,7 @@ from datetime import datetime
 # --- 1. FIREBASE SETUP ---
 if not firebase_admin._apps:
     try:
+        # Load secrets from Streamlit
         creds_dict = dict(st.secrets["firebase_credentials"])
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
@@ -69,7 +70,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("GSO Finder")
+    st.title("💜 GSO Cloud")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
 
 # --- PAGE: DASHBOARD ---
@@ -149,15 +150,16 @@ elif menu == "Search & Merge":
         for index, row in df.iterrows():
             match_found = None
             
-            # STRATEGY: Query ONE field (Fast & Indexed by default), then Filter in Python
+            # THE HYBRID SEARCH STRATEGY:
             if mode == "MICHELIN / BFG":
                 target_ref = row.iloc[0].strip().zfill(6)
                 target_country = row.iloc[1].strip().upper()
                 
-                # 1. Broad Query (Ref Only) - Never fails
+                # 1. Broad Query: Get ALL items with this Ref No (usually 1-5 items)
+                # This works because Firestore automatically indexes single fields.
                 docs = db.collection("gso_database").where("ref_no", "==", target_ref).stream()
                 
-                # 2. Strict Filter (Country) - Done locally
+                # 2. Strict Filter: Check the Country in Python
                 for doc in docs:
                     data = doc.to_dict()
                     if data.get('country') == target_country:
@@ -169,13 +171,13 @@ elif menu == "Search & Merge":
                 target_size = row.iloc[1].strip().replace('/', '-')
                 target_pattern = row.iloc[2].strip().upper()
                 
-                # 1. Broad Query (Size Only) - Never fails, handles "/" to "-" conversion
+                # 1. Broad Query: Get ALL items with this Size (usually 10-50 items)
+                # This is safe and won't crash the memory.
                 docs = db.collection("gso_database").where("size", "==", target_size).stream()
                 
-                # 2. Strict Filter (Brand & Pattern) - Done locally
+                # 2. Strict Filter: Check Brand and Pattern in Python
                 for doc in docs:
                     data = doc.to_dict()
-                    # Check Brand AND Pattern match
                     if data.get('brand') == target_brand and data.get('pattern') == target_pattern:
                         match_found = {**data, "id": doc.id}
                         break
