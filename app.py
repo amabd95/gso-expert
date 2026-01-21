@@ -13,7 +13,7 @@ if not firebase_admin._apps:
         creds_dict = dict(st.secrets["firebase_credentials"])
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
-            'storageBucket': 'gso-database.firebasestorage.app' # <--- VERIFY YOUR BUCKET LINK HERE
+            'storageBucket': 'gso-database.firebasestorage.app' # <--- IMPORTANT: CHECK YOUR BUCKET LINK
         })
     except Exception as e:
         st.error(f"Database Connection Failed: {e}")
@@ -24,6 +24,7 @@ bucket = storage.bucket()
 
 # --- 2. HELPER FUNCTIONS ---
 def format_date_to_string(date_str):
+    # Converts dates like '12 JAN 2025' to '120125'
     months = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
               'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
     try:
@@ -53,19 +54,40 @@ def create_template(temp_type):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. THE "PROJECTION" CACHE (CRASH PROOF) ---
+# --- 3. BULLETPROOF LOADER (THE FIX) ---
 @st.cache_data(ttl=600)
 def load_database_index():
-    # We ask for ONLY specific fields. This keeps the download tiny and fast.
-    # It avoids "downloading the whole database" crash.
-    docs = db.collection("gso_database").select(["brand", "size", "pattern", "ref_no", "country", "expiry"]).stream()
+    # 1. TIMEOUT FIX: We explicitly ask for 600 seconds (10 mins) to avoid RetryError
+    # 2. PROJECTION FIX: We only download text fields (tiny data), not the full docs
+    docs = db.collection("gso_database").select(
+        ["brand", "size", "pattern", "ref_no", "country", "expiry"]
+    ).stream(timeout=600)
     
     data = []
     for doc in docs:
         d = doc.to_dict()
         d['id'] = doc.id
         data.append(d)
-    return pd.DataFrame(data)
+    
+    # 3. SAFETY FIX: Create DataFrame and ensure text columns are strings
+    df = pd.DataFrame(data)
+    
+    # Handle empty database case
+    if df.empty:
+        return pd.DataFrame(columns=["brand", "size", "pattern", "ref_no", "country", "expiry", "id"])
+
+    # Ensure all columns exist and are clean strings
+    cols = ["brand", "size", "pattern", "ref_no", "country", "expiry"]
+    for col in cols:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].astype(str).str.strip().str.upper()
+
+    # 4. NORMALIZATION FIX: Force all sizes to use hyphens internally
+    # This guarantees matches even if the database has mixed "/" and "-"
+    df['size'] = df['size'].str.replace('/', '-')
+    
+    return df
 
 # --- 4. UI DESIGN ---
 st.set_page_config(page_title="GSO Expert Pro", layout="wide")
@@ -83,7 +105,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("GSO Finder")
+    st.title("💜 GSO Cloud")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
 
 # --- PAGE: DASHBOARD ---
@@ -91,7 +113,7 @@ if menu == "Dashboard":
     st.title("📊 Control Center")
     today_display = datetime.now().strftime("%d %B %Y")
     
-    if st.button("🔄 Reload Database"):
+    if st.button("🔄 Refresh Database"):
         load_database_index.clear()
         st.success("Database cache refreshed!")
 
@@ -162,8 +184,8 @@ elif menu == "Search & Merge":
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
     if excel_file and st.button("Generate Report"):
-        # 1. LOAD DATA: This is the ONLY time we touch the database.
-        with st.spinner("Downloading Index..."):
+        # 1. LOAD INDEX: Download the "map" of the database (With 600s timeout safety)
+        with st.spinner("Downloading Database Index (this happens once)..."):
             db_df = load_database_index()
         
         # 2. LOAD EXCEL
@@ -172,43 +194,44 @@ elif menu == "Search & Merge":
         missing = []
         progress_bar = st.progress(0)
         
-        # 3. PURE PYTHON MATCHING (Zero Network Calls)
+        # 3. INSTANT SEARCH (0 Latency because db_df is in memory)
         for index, row in df.iterrows():
-            match = None
+            matches = pd.DataFrame()
             
             if mode == "MICHELIN / BFG":
                 t_ref = row.iloc[0].strip().zfill(6)
                 t_country = row.iloc[1].strip().upper()
-                # Filter DataFrame instantly
-                matches = db_df[
-                    (db_df['ref_no'] == t_ref) & 
-                    (db_df['country'] == t_country)
-                ]
+                if not db_df.empty:
+                    matches = db_df[
+                        (db_df['ref_no'] == t_ref) & 
+                        (db_df['country'] == t_country)
+                    ]
             else:
                 t_brand = row.iloc[0].strip().upper()
-                t_size = row.iloc[1].strip().replace('/', '-')
+                t_size = row.iloc[1].strip().replace('/', '-').upper() # Force hyphen for match
                 t_pattern = row.iloc[2].strip().upper()
                 
-                # Check for exact matches first
-                matches = db_df[
-                    (db_df['brand'] == t_brand) & 
-                    (db_df['pattern'] == t_pattern) &
-                    (db_df['size'] == t_size)
-                ]
+                if not db_df.empty:
+                    matches = db_df[
+                        (db_df['brand'] == t_brand) & 
+                        (db_df['pattern'] == t_pattern) &
+                        (db_df['size'] == t_size)
+                    ]
 
+            # 4. DOWNLOAD PDF
             if not matches.empty:
-                # Take the first match
-                found_item = matches.iloc[0]
+                found_item = matches.iloc[0] # Take first match
                 if is_expired(found_item['expiry']):
-                    missing.append(f"Row {index+2}: Expired")
+                    missing.append(f"Row {index+2}: Certificate Expired")
                 else:
                     try:
-                        # 4. DOWNLOAD ONLY THE PDF WE NEED
+                        # This is the ONLY network call in the loop
                         pdf_bytes = bucket.blob(f"certificates/{found_item['id']}.pdf").download_as_bytes()
                         match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                         for page in match_doc: add_signature_to_pdf(page)
                         combined_pdf.insert_pdf(match_doc)
-                    except: missing.append(f"Row {index+2}: File Missing in Storage")
+                    except Exception as e:
+                        missing.append(f"Row {index+2}: Found in DB but PDF missing in Storage")
             else:
                 missing.append(f"Row {index+2}: Not Found")
             
