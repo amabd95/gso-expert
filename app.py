@@ -1,17 +1,34 @@
-# --- 1. FIREBASE SETUP (UPDATED FOR SECRETS) ---
+import streamlit as st
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+import fitz  # PyMuPDF
+import pandas as pd
+import io
+import re
+from datetime import datetime
+
+# --- 1. FIREBASE SETUP (SECRETS MANAGER) ---
+# This block checks if the app is already connected to avoid errors on reload
 if not firebase_admin._apps:
-    # This part pulls the data from the 'Secrets' you saved in Streamlit
-    creds_dict = dict(st.secrets["firebase_credentials"])
-    cred = credentials.Certificate(creds_dict)
-    firebase_admin.initialize_app(cred, {
-        'storageBucket': 'gso-database.firebasestorage.app' # Replace with your bucket link
-    })
+    try:
+        # Load credentials from Streamlit Secrets
+        creds_dict = dict(st.secrets["firebase_credentials"])
+        cred = credentials.Certificate(creds_dict)
+        
+        # Connect to Firebase
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': 'gso-database.firebasestorage.app' # <--- IMPORTANT: PASTE YOUR BUCKET LINK HERE
+        })
+    except Exception as e:
+        st.error(f"Failed to connect to Firebase. Check your Secrets settings. Error: {e}")
+        st.stop()
 
 db = firestore.client()
 bucket = storage.bucket()
 
 # --- 2. HELPER FUNCTIONS ---
 def format_date_to_string(date_str):
+    # Converts '18 MAY 2026' to '180526'
     months = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
               'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
     try:
@@ -20,20 +37,34 @@ def format_date_to_string(date_str):
     except: return "000000"
 
 def is_expired(expiry_ddmmyy):
+    # Checks if the certificate date is in the past
     try:
         exp_date = datetime.strptime(expiry_ddmmyy, "%d%m%y")
-        return exp_date < datetime.today()
+        return exp_date.date() < datetime.today().date()
     except: return True
 
 def add_signature_to_pdf(page):
+    # Stamps the signature on the page
     text = "MADE BY ABDULLAH ALHAKIM"
     page_rect = page.rect
     point = fitz.Point(page_rect.width - 200, page_rect.height - 20)
     page.insert_text(point, text, fontsize=10, color=(0.4, 0.4, 0.4))
 
+def get_last_update():
+    # Fetches the last sync time from Firestore
+    try:
+        doc = db.collection("metadata").document("last_sync").get()
+        return doc.to_dict().get("timestamp", "Never") if doc.exists else "Never"
+    except: return "Never"
+
 def create_template(temp_type):
+    # Generates blank Excel templates for the user
     output = io.BytesIO()
-    df = pd.DataFrame(columns=["Ref Number", "Country"]) if temp_type == "MICHELIN" else pd.DataFrame(columns=["Brand", "Size", "Pattern"])
+    if temp_type == "MICHELIN":
+        df = pd.DataFrame(columns=["Ref Number", "Country"])
+    else:
+        df = pd.DataFrame(columns=["Brand", "Size", "Pattern"])
+    
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False)
     return output.getvalue()
@@ -54,6 +85,7 @@ st.markdown("""
     <div class="footer">MADE BY ABDULLAH ALHAKIM</div>
     """, unsafe_allow_html=True)
 
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("GSO Finder")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
@@ -65,14 +97,18 @@ if menu == "Dashboard":
     c1, c2 = st.columns(2)
     with c1: st.metric("System Date", today_display)
     with c2: st.metric("Database", "Online")
+    
     st.markdown("### 📥 Templates")
-    st.download_button("Download Michelin Template", create_template("MICHELIN"), "Michelin_Template.xlsx")
-    st.download_button("Download Others Template", create_template("OTHERS"), "Others_Template.xlsx")
+    tc1, tc2 = st.columns(2)
+    with tc1: st.download_button("Download Michelin Template", create_template("MICHELIN"), "Michelin_Template.xlsx")
+    with tc2: st.download_button("Download Others Template", create_template("OTHERS"), "Others_Template.xlsx")
 
 # --- PAGE: ADD NEW ---
 elif menu == "Add Certificates":
     st.title("📥 Batch Upload")
+    st.write(f"**Last Sync:** `{get_last_update()}`")
     uploaded_pdfs = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+    
     if st.button("Sync to Cloud"):
         for uploaded_file in uploaded_pdfs:
             doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
@@ -83,6 +119,7 @@ elif menu == "Add Certificates":
                         brand = re.search(r"Brand:\s*(.*)", text).group(1).strip().upper()
                         expiry_raw = re.search(r"Date of Expiry:\s*(\d{1,2}\s*[A-Z]{3}\s*\d{4})", text).group(1).strip()
                         exp = format_date_to_string(expiry_raw)
+                        
                         if is_expired(exp): continue
                         
                         ref = re.search(r"Manufacturer Ref No:\s*(.*)", text).group(1).strip().zfill(6)
@@ -91,8 +128,12 @@ elif menu == "Add Certificates":
                         country = re.search(r"Country of Production:\s*(.*)", text).group(1).strip().upper()
 
                         clean_size = size.replace('/', '-')
-                        # We use a unique ID for the document to make searching 100% accurate
-                        doc_id = f"{brand}_{ref}_{country}_{exp}" if brand in ["MICHELIN", "BFGOODRICH"] else f"{brand}_{clean_size}_{pattern}_{exp}"
+                        
+                        # Unique ID for Document
+                        if brand in ["MICHELIN", "BFGOODRICH"]:
+                            doc_id = f"{brand}_{ref}_{country}_{exp}"
+                        else:
+                            doc_id = f"{brand}_{clean_size}_{pattern}_{exp}"
 
                         new_doc = fitz.open()
                         new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
@@ -106,6 +147,9 @@ elif menu == "Add Certificates":
                         })
                         st.success(f"Uploaded: {doc_id}")
                     except: continue
+        
+        now = datetime.now().strftime("%d %b %Y, %H:%M")
+        db.collection("metadata").document("last_sync").set({"timestamp": now})
         st.success("Sync Complete!")
 
 # --- PAGE: SEARCH ---
@@ -119,21 +163,20 @@ elif menu == "Search & Merge":
         combined_pdf = fitz.open()
         missing = []
         
-        # Optimized Search: We fetch only relevant documents
         progress_bar = st.progress(0)
         total = len(df)
 
         for index, row in df.iterrows():
-            found_doc = None
             if mode == "MICHELIN / BFG":
                 ref = row.iloc[0].strip().zfill(6)
                 country = row.iloc[1].strip().upper()
-                # Use a specific query on documented fields
+                # Fast Query (Requires Firestore Index)
                 results = db.collection("gso_database").where("ref_no", "==", ref).where("country", "==", country).limit(1).get()
             else:
                 brand = row.iloc[0].strip().upper()
                 size = row.iloc[1].strip().replace('/', '-')
                 pattern = row.iloc[2].strip().upper()
+                # Fast Query (Requires Firestore Index)
                 results = db.collection("gso_database").where("brand", "==", brand).where("size", "==", size).where("pattern", "==", pattern).limit(1).get()
 
             if results:
@@ -153,9 +196,7 @@ elif menu == "Search & Merge":
         if len(combined_pdf) > 0:
             out = io.BytesIO()
             combined_pdf.save(out)
-            st.success(f"Generated {len(combined_pdf)} Page PDF")
             st.download_button("📥 DOWNLOAD REPORT", out.getvalue(), "GSO_Final_Report.pdf", "application/pdf")
         if missing:
             with st.expander("Errors/Missing"):
                 for m in missing: st.error(m)
-
