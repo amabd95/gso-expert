@@ -13,7 +13,7 @@ if not firebase_admin._apps:
         creds_dict = dict(st.secrets["firebase_credentials"])
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
-            'storageBucket': 'gso-database.firebasestorage.app' # <--- IMPORTANT: CHECK YOUR BUCKET LINK
+            'storageBucket': 'gso-database.firebasestorage.app'
         })
     except Exception as e:
         st.error(f"Database Connection Failed: {e}")
@@ -54,22 +54,49 @@ def create_template(temp_type):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. BULLETPROOF LOADER (THE FIX) ---
+# --- 3. FIXED LOADER WITH BATCH FETCHING ---
 @st.cache_data(ttl=600)
 def load_database_index():
-    # 1. TIMEOUT FIX: We explicitly ask for 600 seconds (10 mins) to avoid RetryError
-    # 2. PROJECTION FIX: We only download text fields (tiny data), not the full docs
-    docs = db.collection("gso_database").select(
-        ["brand", "size", "pattern", "ref_no", "country", "expiry"]
-    ).stream(timeout=600)
-    
+    """
+    Load database with proper pagination to avoid timeouts
+    """
     data = []
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        data.append(d)
     
-    # 3. SAFETY FIX: Create DataFrame and ensure text columns are strings
+    try:
+        # Method 1: Use get() instead of stream() - it's more reliable
+        docs_ref = db.collection("gso_database")
+        
+        # Fetch in batches to avoid timeout
+        batch_size = 500
+        last_doc = None
+        
+        while True:
+            query = docs_ref.limit(batch_size)
+            
+            if last_doc:
+                query = query.start_after(last_doc)
+            
+            # Use get() which is more reliable than stream()
+            docs = query.get()
+            
+            if not docs:
+                break
+            
+            for doc in docs:
+                d = doc.to_dict()
+                d['id'] = doc.id
+                data.append(d)
+            
+            if len(docs) < batch_size:
+                break
+            
+            last_doc = docs[-1]
+        
+    except Exception as e:
+        st.error(f"Error loading database: {e}")
+        return pd.DataFrame(columns=["brand", "size", "pattern", "ref_no", "country", "expiry", "id"])
+    
+    # Create DataFrame
     df = pd.DataFrame(data)
     
     # Handle empty database case
@@ -83,8 +110,7 @@ def load_database_index():
             df[col] = ""
         df[col] = df[col].astype(str).str.strip().str.upper()
 
-    # 4. NORMALIZATION FIX: Force all sizes to use hyphens internally
-    # This guarantees matches even if the database has mixed "/" and "-"
+    # Normalization: Force all sizes to use hyphens internally
     df['size'] = df['size'].str.replace('/', '-')
     
     return df
@@ -105,7 +131,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("💜 GSO Cloud")
+    st.title("GSO Finder")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
 
 # --- PAGE: DASHBOARD ---
@@ -184,9 +210,13 @@ elif menu == "Search & Merge":
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
     if excel_file and st.button("Generate Report"):
-        # 1. LOAD INDEX: Download the "map" of the database (With 600s timeout safety)
-        with st.spinner("Downloading Database Index (this happens once)..."):
+        # 1. LOAD INDEX: Download the "map" of the database
+        with st.spinner("Loading Database Index..."):
             db_df = load_database_index()
+        
+        if db_df.empty:
+            st.error("Database is empty or failed to load")
+            st.stop()
         
         # 2. LOAD EXCEL
         df = pd.read_excel(excel_file).astype(str).apply(lambda x: x.str.replace(r'\.0$', '', regex=True))
@@ -208,7 +238,7 @@ elif menu == "Search & Merge":
                     ]
             else:
                 t_brand = row.iloc[0].strip().upper()
-                t_size = row.iloc[1].strip().replace('/', '-').upper() # Force hyphen for match
+                t_size = row.iloc[1].strip().replace('/', '-').upper()
                 t_pattern = row.iloc[2].strip().upper()
                 
                 if not db_df.empty:
@@ -220,12 +250,11 @@ elif menu == "Search & Merge":
 
             # 4. DOWNLOAD PDF
             if not matches.empty:
-                found_item = matches.iloc[0] # Take first match
+                found_item = matches.iloc[0]
                 if is_expired(found_item['expiry']):
                     missing.append(f"Row {index+2}: Certificate Expired")
                 else:
                     try:
-                        # This is the ONLY network call in the loop
                         pdf_bytes = bucket.blob(f"certificates/{found_item['id']}.pdf").download_as_bytes()
                         match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                         for page in match_doc: add_signature_to_pdf(page)
