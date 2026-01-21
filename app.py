@@ -76,7 +76,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("💜 GSO Cloud")
+    st.title("GSO Finder")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
 
 # --- PAGE: DASHBOARD ---
@@ -209,3 +209,4 @@ elif menu == "Search & Merge":
         if missing:
             with st.expander("Errors/Missing"):
                 for m in missing: st.error(m)
+
