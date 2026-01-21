@@ -10,7 +10,14 @@ from datetime import datetime
 # --- 1. FIREBASE SETUP ---
 if not firebase_admin._apps:
     try:
+        # Fix private key formatting issue
         creds_dict = dict(st.secrets["firebase_credentials"])
+        
+        # Ensure private_key has proper newlines
+        if "private_key" in creds_dict:
+            # Replace literal \n with actual newlines
+            creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+        
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
             'storageBucket': 'gso-database.firebasestorage.app'
