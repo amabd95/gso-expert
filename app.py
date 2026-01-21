@@ -7,20 +7,16 @@ import io
 import re
 from datetime import datetime
 
-# --- 1. FIREBASE SETUP (SECRETS MANAGER) ---
-# This block checks if the app is already connected to avoid errors on reload
+# --- 1. FIREBASE SETUP ---
 if not firebase_admin._apps:
     try:
-        # Load credentials from Streamlit Secrets
         creds_dict = dict(st.secrets["firebase_credentials"])
         cred = credentials.Certificate(creds_dict)
-        
-        # Connect to Firebase
         firebase_admin.initialize_app(cred, {
-            'storageBucket': 'gso-database.firebasestorage.app' # <--- IMPORTANT: PASTE YOUR BUCKET LINK HERE
+            'storageBucket': 'gso-database.firebasestorage.app' # <--- PASTE YOUR BUCKET LINK HERE
         })
     except Exception as e:
-        st.error(f"Failed to connect to Firebase. Check your Secrets settings. Error: {e}")
+        st.error(f"Database Connection Failed: {e}")
         st.stop()
 
 db = firestore.client()
@@ -28,7 +24,6 @@ bucket = storage.bucket()
 
 # --- 2. HELPER FUNCTIONS ---
 def format_date_to_string(date_str):
-    # Converts '18 MAY 2026' to '180526'
     months = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
               'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
     try:
@@ -37,41 +32,36 @@ def format_date_to_string(date_str):
     except: return "000000"
 
 def is_expired(expiry_ddmmyy):
-    # Checks if the certificate date is in the past
     try:
         exp_date = datetime.strptime(expiry_ddmmyy, "%d%m%y")
         return exp_date.date() < datetime.today().date()
     except: return True
 
 def add_signature_to_pdf(page):
-    # Stamps the signature on the page
     text = "MADE BY ABDULLAH ALHAKIM"
     page_rect = page.rect
     point = fitz.Point(page_rect.width - 200, page_rect.height - 20)
     page.insert_text(point, text, fontsize=10, color=(0.4, 0.4, 0.4))
 
-def get_last_update():
-    # Fetches the last sync time from Firestore
-    try:
-        doc = db.collection("metadata").document("last_sync").get()
-        return doc.to_dict().get("timestamp", "Never") if doc.exists else "Never"
-    except: return "Never"
-
 def create_template(temp_type):
-    # Generates blank Excel templates for the user
     output = io.BytesIO()
     if temp_type == "MICHELIN":
         df = pd.DataFrame(columns=["Ref Number", "Country"])
     else:
         df = pd.DataFrame(columns=["Brand", "Size", "Pattern"])
-    
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. UI DESIGN (MATT PURPLE) ---
-st.set_page_config(page_title="GSO Expert Pro", layout="wide")
+# --- 3. CACHING ENGINE (THE FIX) ---
+@st.cache_data(ttl=600) # Caches the database for 10 minutes to prevent timeouts
+def fetch_all_certificates():
+    # Downloads ONLY the text data (Brand, Size, etc.), not the PDFs. Fast & Cheap.
+    docs = db.collection("gso_database").stream()
+    return [{**doc.to_dict(), "id": doc.id} for doc in docs]
 
+# --- 4. UI DESIGN ---
+st.set_page_config(page_title="GSO Expert Pro", layout="wide")
 st.markdown("""
     <style>
     .stApp { background-color: #F3F0F7; }
@@ -85,15 +75,20 @@ st.markdown("""
     <div class="footer">MADE BY ABDULLAH ALHAKIM</div>
     """, unsafe_allow_html=True)
 
-# --- SIDEBAR ---
 with st.sidebar:
-    st.title("GSO Finder")
+    st.title("💜 GSO Cloud")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
 
 # --- PAGE: DASHBOARD ---
 if menu == "Dashboard":
     st.title("📊 Control Center")
     today_display = datetime.now().strftime("%d %B %Y")
+    
+    # Force a reload of the cache to ensure fresh data
+    if st.button("🔄 Refresh Database"):
+        fetch_all_certificates.clear()
+        st.success("Database cache cleared!")
+
     c1, c2 = st.columns(2)
     with c1: st.metric("System Date", today_display)
     with c2: st.metric("Database", "Online")
@@ -106,11 +101,13 @@ if menu == "Dashboard":
 # --- PAGE: ADD NEW ---
 elif menu == "Add Certificates":
     st.title("📥 Batch Upload")
-    st.write(f"**Last Sync:** `{get_last_update()}`")
     uploaded_pdfs = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
     
     if st.button("Sync to Cloud"):
-        for uploaded_file in uploaded_pdfs:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, uploaded_file in enumerate(uploaded_pdfs):
             doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
             for page_num in range(0, len(doc), 2):
                 text = doc[page_num].get_text()
@@ -129,7 +126,6 @@ elif menu == "Add Certificates":
 
                         clean_size = size.replace('/', '-')
                         
-                        # Unique ID for Document
                         if brand in ["MICHELIN", "BFGOODRICH"]:
                             doc_id = f"{brand}_{ref}_{country}_{exp}"
                         else:
@@ -145,11 +141,13 @@ elif menu == "Add Certificates":
                             "brand": brand, "expiry": exp, "url": blob.public_url,
                             "ref_no": ref, "country": country, "size": clean_size, "pattern": pattern
                         })
-                        st.success(f"Uploaded: {doc_id}")
                     except: continue
+            
+            progress_bar.progress((i + 1) / len(uploaded_pdfs))
+            status_text.text(f"Processed file {i+1} of {len(uploaded_pdfs)}")
         
-        now = datetime.now().strftime("%d %b %Y, %H:%M")
-        db.collection("metadata").document("last_sync").set({"timestamp": now})
+        # Clear cache so new files appear in search immediately
+        fetch_all_certificates.clear()
         st.success("Sync Complete!")
 
 # --- PAGE: SEARCH ---
@@ -159,43 +157,54 @@ elif menu == "Search & Merge":
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
     if excel_file and st.button("Generate Report"):
+        # 1. LOAD DATA: Fetch all database entries ONCE (Cached)
+        with st.spinner("Loading Database..."):
+            all_certs = fetch_all_certificates()
+        
+        # 2. PROCESS EXCEL
         df = pd.read_excel(excel_file).astype(str).apply(lambda x: x.str.replace(r'\.0$', '', regex=True))
         combined_pdf = fitz.open()
         missing = []
-        
         progress_bar = st.progress(0)
-        total = len(df)
-
+        
+        # 3. INSTANT FILTERING (Python Side)
         for index, row in df.iterrows():
+            match_found = None
+            
             if mode == "MICHELIN / BFG":
-                ref = row.iloc[0].strip().zfill(6)
-                country = row.iloc[1].strip().upper()
-                # Fast Query (Requires Firestore Index)
-                results = db.collection("gso_database").where("ref_no", "==", ref).where("country", "==", country).limit(1).get()
+                target_ref = row.iloc[0].strip().zfill(6)
+                target_country = row.iloc[1].strip().upper()
+                # Search the loaded list
+                match_found = next((item for item in all_certs if item.get('ref_no') == target_ref and item.get('country') == target_country), None)
             else:
-                brand = row.iloc[0].strip().upper()
-                size = row.iloc[1].strip().replace('/', '-')
-                pattern = row.iloc[2].strip().upper()
-                # Fast Query (Requires Firestore Index)
-                results = db.collection("gso_database").where("brand", "==", brand).where("size", "==", size).where("pattern", "==", pattern).limit(1).get()
+                target_brand = row.iloc[0].strip().upper()
+                # Normalize Excel input (replace / with -)
+                target_size = row.iloc[1].strip().replace('/', '-')
+                target_pattern = row.iloc[2].strip().upper()
+                
+                # Smart Match: Check if sizes match (ignoring small typos)
+                match_found = next((item for item in all_certs if item.get('brand') == target_brand and item.get('pattern') == target_pattern and target_size in item.get('size', '').replace('/', '-')), None)
 
-            if results:
-                data = results[0].to_dict()
-                if is_expired(data['expiry']):
+            if match_found:
+                if is_expired(match_found['expiry']):
                     missing.append(f"Row {index+2}: Expired")
                 else:
-                    pdf_bytes = bucket.blob(f"certificates/{results[0].id}.pdf").download_as_bytes()
-                    match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                    for page in match_doc: add_signature_to_pdf(page)
-                    combined_pdf.insert_pdf(match_doc)
+                    # Only contact Google to download the specific PDF
+                    try:
+                        pdf_bytes = bucket.blob(f"certificates/{match_found['id']}.pdf").download_as_bytes()
+                        match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                        for page in match_doc: add_signature_to_pdf(page)
+                        combined_pdf.insert_pdf(match_doc)
+                    except: missing.append(f"Row {index+2}: File Missing in Storage")
             else:
                 missing.append(f"Row {index+2}: Not Found")
             
-            progress_bar.progress((index + 1) / total)
+            progress_bar.progress((index + 1) / len(df))
 
         if len(combined_pdf) > 0:
             out = io.BytesIO()
             combined_pdf.save(out)
+            st.success(f"Generated {len(combined_pdf)} Page PDF")
             st.download_button("📥 DOWNLOAD REPORT", out.getvalue(), "GSO_Final_Report.pdf", "application/pdf")
         if missing:
             with st.expander("Errors/Missing"):
