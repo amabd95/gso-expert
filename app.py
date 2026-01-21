@@ -10,7 +10,6 @@ from datetime import datetime
 # --- 1. FIREBASE SETUP ---
 if not firebase_admin._apps:
     try:
-        # Load secrets from Streamlit
         creds_dict = dict(st.secrets["firebase_credentials"])
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
@@ -54,7 +53,21 @@ def create_template(temp_type):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. UI DESIGN ---
+# --- 3. THE "PROJECTION" CACHE (CRASH PROOF) ---
+@st.cache_data(ttl=600)
+def load_database_index():
+    # We ask for ONLY specific fields. This keeps the download tiny and fast.
+    # It avoids "downloading the whole database" crash.
+    docs = db.collection("gso_database").select(["brand", "size", "pattern", "ref_no", "country", "expiry"]).stream()
+    
+    data = []
+    for doc in docs:
+        d = doc.to_dict()
+        d['id'] = doc.id
+        data.append(d)
+    return pd.DataFrame(data)
+
+# --- 4. UI DESIGN ---
 st.set_page_config(page_title="GSO Expert Pro", layout="wide")
 st.markdown("""
     <style>
@@ -70,13 +83,18 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.title("💜 GSO Cloud")
+    st.title("GSO Finder")
     menu = st.radio("WORKFLOW", ["Dashboard", "Add Certificates", "Search & Merge"])
 
 # --- PAGE: DASHBOARD ---
 if menu == "Dashboard":
     st.title("📊 Control Center")
     today_display = datetime.now().strftime("%d %B %Y")
+    
+    if st.button("🔄 Reload Database"):
+        load_database_index.clear()
+        st.success("Database cache refreshed!")
+
     c1, c2 = st.columns(2)
     with c1: st.metric("System Date", today_display)
     with c2: st.metric("Database", "Online")
@@ -133,6 +151,8 @@ elif menu == "Add Certificates":
             
             progress_bar.progress((i + 1) / len(uploaded_pdfs))
             status_text.text(f"Processed file {i+1} of {len(uploaded_pdfs)}")
+        
+        load_database_index.clear()
         st.success("Sync Complete!")
 
 # --- PAGE: SEARCH ---
@@ -142,53 +162,49 @@ elif menu == "Search & Merge":
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
     if excel_file and st.button("Generate Report"):
+        # 1. LOAD DATA: This is the ONLY time we touch the database.
+        with st.spinner("Downloading Index..."):
+            db_df = load_database_index()
+        
+        # 2. LOAD EXCEL
         df = pd.read_excel(excel_file).astype(str).apply(lambda x: x.str.replace(r'\.0$', '', regex=True))
         combined_pdf = fitz.open()
         missing = []
         progress_bar = st.progress(0)
         
+        # 3. PURE PYTHON MATCHING (Zero Network Calls)
         for index, row in df.iterrows():
-            match_found = None
+            match = None
             
-            # THE HYBRID SEARCH STRATEGY:
             if mode == "MICHELIN / BFG":
-                target_ref = row.iloc[0].strip().zfill(6)
-                target_country = row.iloc[1].strip().upper()
-                
-                # 1. Broad Query: Get ALL items with this Ref No (usually 1-5 items)
-                # This works because Firestore automatically indexes single fields.
-                docs = db.collection("gso_database").where("ref_no", "==", target_ref).stream()
-                
-                # 2. Strict Filter: Check the Country in Python
-                for doc in docs:
-                    data = doc.to_dict()
-                    if data.get('country') == target_country:
-                        match_found = {**data, "id": doc.id}
-                        break
-                        
+                t_ref = row.iloc[0].strip().zfill(6)
+                t_country = row.iloc[1].strip().upper()
+                # Filter DataFrame instantly
+                matches = db_df[
+                    (db_df['ref_no'] == t_ref) & 
+                    (db_df['country'] == t_country)
+                ]
             else:
-                target_brand = row.iloc[0].strip().upper()
-                target_size = row.iloc[1].strip().replace('/', '-')
-                target_pattern = row.iloc[2].strip().upper()
+                t_brand = row.iloc[0].strip().upper()
+                t_size = row.iloc[1].strip().replace('/', '-')
+                t_pattern = row.iloc[2].strip().upper()
                 
-                # 1. Broad Query: Get ALL items with this Size (usually 10-50 items)
-                # This is safe and won't crash the memory.
-                docs = db.collection("gso_database").where("size", "==", target_size).stream()
-                
-                # 2. Strict Filter: Check Brand and Pattern in Python
-                for doc in docs:
-                    data = doc.to_dict()
-                    if data.get('brand') == target_brand and data.get('pattern') == target_pattern:
-                        match_found = {**data, "id": doc.id}
-                        break
+                # Check for exact matches first
+                matches = db_df[
+                    (db_df['brand'] == t_brand) & 
+                    (db_df['pattern'] == t_pattern) &
+                    (db_df['size'] == t_size)
+                ]
 
-            # 3. Process Result
-            if match_found:
-                if is_expired(match_found['expiry']):
+            if not matches.empty:
+                # Take the first match
+                found_item = matches.iloc[0]
+                if is_expired(found_item['expiry']):
                     missing.append(f"Row {index+2}: Expired")
                 else:
                     try:
-                        pdf_bytes = bucket.blob(f"certificates/{match_found['id']}.pdf").download_as_bytes()
+                        # 4. DOWNLOAD ONLY THE PDF WE NEED
+                        pdf_bytes = bucket.blob(f"certificates/{found_item['id']}.pdf").download_as_bytes()
                         match_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                         for page in match_doc: add_signature_to_pdf(page)
                         combined_pdf.insert_pdf(match_doc)
