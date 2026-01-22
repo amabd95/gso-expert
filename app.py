@@ -88,7 +88,7 @@ def is_expired(expiry_ddmmyy):
     except: return True
 
 def add_signature_to_pdf(page):
-    text = "MADE BY ABDULLAH ALHAKIM"
+    text = " "
     page_rect = page.rect
     point = fitz.Point(page_rect.width - 200, page_rect.height - 20)
     page.insert_text(point, text, fontsize=10, color=(0.4, 0.4, 0.4))
@@ -295,3 +295,4 @@ elif menu == "Search & Merge":
         if missing:
             with st.expander("Errors/Missing"):
                 for m in missing: st.error(m)
+
