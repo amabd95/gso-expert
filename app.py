@@ -7,23 +7,66 @@ import io
 import re
 from datetime import datetime
 
-# --- 1. FIREBASE SETUP ---
+# --- 1. FIREBASE SETUP WITH DETAILED DIAGNOSTICS ---
 if not firebase_admin._apps:
     try:
-        # Fix private key formatting issue
+        st.info("🔐 Attempting Firebase connection...")
+        
+        # Method 1: Try with proper key formatting
         creds_dict = dict(st.secrets["firebase_credentials"])
         
-        # Ensure private_key has proper newlines
+        # Debug: Show what we're receiving (without exposing the actual key)
+        st.write("Credential fields found:", list(creds_dict.keys()))
+        
+        # Fix private key formatting - multiple methods
         if "private_key" in creds_dict:
-            # Replace literal \n with actual newlines
-            creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+            private_key = creds_dict["private_key"]
+            
+            # Check if key needs newline replacement
+            if "\\n" in private_key:
+                private_key = private_key.replace('\\n', '\n')
+                st.info("✓ Replaced escaped newlines")
+            
+            # Ensure key starts and ends correctly
+            if not private_key.startswith("-----BEGIN"):
+                st.error("❌ Private key doesn't start with -----BEGIN PRIVATE KEY-----")
+            if not private_key.rstrip().endswith("-----"):
+                st.error("❌ Private key doesn't end with -----END PRIVATE KEY-----")
+            
+            creds_dict["private_key"] = private_key
         
         cred = credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred, {
             'storageBucket': 'gso-database.firebasestorage.app'
         })
+        st.success("✅ Firebase initialized successfully!")
+        
     except Exception as e:
-        st.error(f"Database Connection Failed: {e}")
+        st.error(f"❌ Database Connection Failed: {str(e)}")
+        st.write("**Error Type:**", type(e).__name__)
+        
+        # Provide troubleshooting steps
+        st.markdown("""
+        ### 🔧 Troubleshooting Steps:
+        
+        1. **Generate NEW credentials from Firebase Console:**
+           - Go to Firebase Console → Project Settings → Service Accounts
+           - Click "Generate New Private Key"
+           - Download the JSON file
+        
+        2. **In Streamlit Cloud Secrets, paste the ENTIRE JSON content directly:**
+           ```
+           [firebase_credentials]
+           type = "service_account"
+           project_id = "your-project-id"
+           private_key_id = "your-key-id"
+           private_key = "-----BEGIN PRIVATE KEY-----\\nYOUR_KEY_HERE\\n-----END PRIVATE KEY-----\\n"
+           client_email = "your-email@project.iam.gserviceaccount.com"
+           ...rest of fields...
+           ```
+        
+        3. **Make sure private_key is on ONE line with \\n (backslash-n) not actual line breaks**
+        """)
         st.stop()
 
 db = firestore.client()
@@ -31,7 +74,6 @@ bucket = storage.bucket()
 
 # --- 2. HELPER FUNCTIONS ---
 def format_date_to_string(date_str):
-    # Converts dates like '12 JAN 2025' to '120125'
     months = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
               'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
     try:
@@ -61,63 +103,39 @@ def create_template(temp_type):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-# --- 3. FIXED LOADER WITH BATCH FETCHING ---
+# --- 3. DATABASE LOADER ---
 @st.cache_data(ttl=600)
 def load_database_index():
-    """
-    Load database with proper pagination to avoid timeouts
-    """
+    """Load database with batch fetching"""
     data = []
     
     try:
-        # Method 1: Use get() instead of stream() - it's more reliable
         docs_ref = db.collection("gso_database")
         
-        # Fetch in batches to avoid timeout
-        batch_size = 500
-        last_doc = None
+        # Simple approach - get all documents
+        # If database is large (>1000 docs), we'll need pagination
+        docs = docs_ref.get()
         
-        while True:
-            query = docs_ref.limit(batch_size)
-            
-            if last_doc:
-                query = query.start_after(last_doc)
-            
-            # Use get() which is more reliable than stream()
-            docs = query.get()
-            
-            if not docs:
-                break
-            
-            for doc in docs:
-                d = doc.to_dict()
-                d['id'] = doc.id
-                data.append(d)
-            
-            if len(docs) < batch_size:
-                break
-            
-            last_doc = docs[-1]
+        for doc in docs:
+            d = doc.to_dict()
+            d['id'] = doc.id
+            data.append(d)
         
     except Exception as e:
         st.error(f"Error loading database: {e}")
         return pd.DataFrame(columns=["brand", "size", "pattern", "ref_no", "country", "expiry", "id"])
     
-    # Create DataFrame
     df = pd.DataFrame(data)
     
-    # Handle empty database case
     if df.empty:
         return pd.DataFrame(columns=["brand", "size", "pattern", "ref_no", "country", "expiry", "id"])
 
-    # Ensure all columns exist and are clean strings
     cols = ["brand", "size", "pattern", "ref_no", "country", "expiry"]
     for col in cols:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].astype(str).str.strip().str.upper()
 
-    # Normalization: Force all sizes to use hyphens internally
     df['size'] = df['size'].str.replace('/', '-')
     
     return df
@@ -217,7 +235,6 @@ elif menu == "Search & Merge":
     excel_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
     if excel_file and st.button("Generate Report"):
-        # 1. LOAD INDEX: Download the "map" of the database
         with st.spinner("Loading Database Index..."):
             db_df = load_database_index()
         
@@ -225,13 +242,11 @@ elif menu == "Search & Merge":
             st.error("Database is empty or failed to load")
             st.stop()
         
-        # 2. LOAD EXCEL
         df = pd.read_excel(excel_file).astype(str).apply(lambda x: x.str.replace(r'\.0$', '', regex=True))
         combined_pdf = fitz.open()
         missing = []
         progress_bar = st.progress(0)
         
-        # 3. INSTANT SEARCH (0 Latency because db_df is in memory)
         for index, row in df.iterrows():
             matches = pd.DataFrame()
             
@@ -255,7 +270,6 @@ elif menu == "Search & Merge":
                         (db_df['size'] == t_size)
                     ]
 
-            # 4. DOWNLOAD PDF
             if not matches.empty:
                 found_item = matches.iloc[0]
                 if is_expired(found_item['expiry']):
